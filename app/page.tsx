@@ -13,6 +13,13 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import Image from "next/image"
 import { webContainerManager } from "@/lib/webcontainer-manager"
 import { EnhancedStreamingMessageParser } from "@/lib/enhanced-streaming-parser"
+import { StreamingParser } from "@/lib/streaming-parser"
+import { fileCache, parsingCache } from "@/lib/cache-manager"
+import { fileValidator } from "@/lib/file-validator"
+import { performanceTracker } from "@/lib/performance-tracker"
+import { diffTracker } from "@/lib/diff-tracker"
+import { commandQueue } from "@/lib/command-queue"
+import { debouncedUpdater } from "@/lib/debounced-updater"
 
 export default function Home() {
   const [generatedCode, setGeneratedCode] = useState<{
@@ -25,6 +32,8 @@ export default function Home() {
   const [streamingFiles, setStreamingFiles] = useState<Record<string, string>>({})
   const [currentFile, setCurrentFile] = useState<string>("")
   const [rawStreamContent, setRawStreamContent] = useState("")
+  const [initialPrompt, setInitialPrompt] = useState<string>("")
+  const [aiResponse, setAiResponse] = useState<string>("")
   const codeContainerRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -32,6 +41,37 @@ export default function Home() {
       codeContainerRef.current.scrollTop = codeContainerRef.current.scrollHeight
     }
   }, [rawStreamContent])
+
+  // Function to extract AI response text without code blocks
+  const extractAiResponseText = (content: string): string => {
+    try {
+      // Remove JSON code blocks
+      let text = content
+        .replace(/```json[\s\S]*?```/gi, "")
+        .replace(/```javascript[\s\S]*?```/gi, "")
+        .replace(/```js[\s\S]*?```/gi, "")
+        .replace(/```jsx[\s\S]*?```/gi, "")
+        .replace(/```ts[\s\S]*?```/gi, "")
+        .replace(/```tsx[\s\S]*?```/gi, "")
+        .replace(/```css[\s\S]*?```/gi, "")
+        .replace(/```html[\s\S]*?```/gi, "")
+        .replace(/```[\s\S]*?```/g, "")
+      
+      // Remove JSON object content
+      text = text.replace(/\{[\s\S]*\}/g, "")
+      
+      // Clean up extra whitespace and newlines
+      text = text
+        .replace(/\n\s*\n\s*\n/g, "\n\n")
+        .replace(/^\s+|\s+$/g, "")
+        .trim()
+      
+      return text
+    } catch (e) {
+      console.error("[v0] Error extracting AI response text:", e)
+      return ""
+    }
+  }
 
   const parseStreamingContent = (content: string) => {
     try {
@@ -105,6 +145,9 @@ export default function Home() {
     console.log("[v0] Starting generation with prompt:", prompt.substring(0, 100) + "...")
     console.log("[v0] Is modification:", isModification)
     
+    // Track performance
+    const startTime = performance.now()
+    
     setIsGenerating(true)
     setGeneratedCode(null)
     setError(null)
@@ -112,6 +155,11 @@ export default function Home() {
     setStreamingFiles({})
     setCurrentFile("")
     setRawStreamContent("")
+    
+    // Store initial prompt for chat context
+    if (!isModification) {
+      setInitialPrompt(prompt)
+    }
 
     const apiKey = localStorage.getItem("openrouter_api_key")
     if (!apiKey) {
@@ -175,16 +223,47 @@ export default function Home() {
         },
       })
 
+      // Initialize We0-style Streaming Parser
+      const streamingParser = new StreamingParser({
+        onActionStream: (action) => {
+          console.log("[StreamingParser] Action streamed:", action.type, action.filePath)
+          if (action.type === 'file' && action.filePath) {
+            const fileName = action.filePath.replace(/^\//, '')
+            files[fileName] = action.content
+            setStreamingFiles({ ...files })
+            
+            // Add to debounced updater
+            debouncedUpdater.addFile(fileName, action.content)
+          } else if (action.type === 'shell') {
+            // Add command to queue
+            const commandId = commandQueue.addCommand(action.content)
+            console.log(`[StreamingParser] Command queued: ${action.content} (ID: ${commandId})`)
+          }
+        },
+        onArtifactComplete: (artifact) => {
+          console.log("[StreamingParser] Artifact complete:", artifact.title, artifact.actions.length, "actions")
+          
+          // Process any pending updates
+          debouncedUpdater.flush()
+        }
+      })
+
       if (reader) {
+        console.log("[v0] Starting to read stream...")
         while (true) {
           const { done, value } = await reader.read()
-          if (done) break
+          if (done) {
+            console.log("[v0] Stream reading completed")
+            break
+          }
 
           const chunk = decoder.decode(value)
+          console.log("[v0] Received chunk:", chunk.substring(0, 200) + "...")
           const lines = chunk.split("\n")
 
           for (const line of lines) {
             if (line.startsWith("data: ")) {
+              console.log("[v0] Processing data line:", line.substring(0, 100) + "...")
               const data = line.slice(6)
               if (data === "[DONE]") {
                 try {
@@ -280,8 +359,10 @@ export default function Home() {
                   let parsedContent: any
                   try {
                     parsedContent = JSON.parse(cleanContent)
+                    console.log("[v0] Successfully parsed JSON directly")
                   } catch (parseError) {
                     console.log("[v0] Failed to parse JSON, trying fallback methods:", parseError)
+                    console.log("[v0] Clean content preview:", cleanContent.substring(0, 500))
                     
                     // Try to extract JSON from markdown code blocks
                     const jsonMatch = accumulatedContent.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/)
@@ -291,24 +372,37 @@ export default function Home() {
                         console.log("[v0] Successfully parsed JSON from code block")
                       } catch (codeBlockError) {
                         console.log("[v0] Failed to parse JSON from code block:", codeBlockError)
-                        throw new Error("Invalid JSON format in AI response")
+                        console.log("[v0] Code block content:", jsonMatch[1].substring(0, 500))
                       }
-                    } else {
-                      // Try to find any JSON-like structure
+                    }
+                    
+                    // If still no success, try to find any JSON-like structure
+                    if (!parsedContent) {
                       const jsonStart = accumulatedContent.indexOf('{')
                       const jsonEnd = accumulatedContent.lastIndexOf('}')
                       if (jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart) {
                         const jsonCandidate = accumulatedContent.substring(jsonStart, jsonEnd + 1)
+                        console.log("[v0] Trying to parse extracted JSON candidate:", jsonCandidate.substring(0, 500))
                         try {
                           parsedContent = JSON.parse(jsonCandidate)
                           console.log("[v0] Successfully parsed JSON from extracted content")
                         } catch (extractError) {
                           console.log("[v0] Failed to parse extracted JSON:", extractError)
-                          throw new Error("Could not extract valid JSON from AI response")
+                          console.log("[v0] JSON candidate:", jsonCandidate.substring(0, 1000))
                         }
-                      } else {
-                        throw new Error("No JSON structure found in AI response")
                       }
+                    }
+                    
+                    // If still no success, try to use Enhanced Parser results as fallback
+                    if (!parsedContent) {
+                      console.log("[v0] No valid JSON found, using Enhanced Parser results as fallback")
+                      // The Enhanced Parser should have populated files during streaming
+                      const enhancedParserFiles = Object.keys(streamingFiles).length > 0 ? streamingFiles : {}
+                      if (Object.keys(enhancedParserFiles).length === 0) {
+                        throw new Error("Could not extract valid JSON from AI response and no files from Enhanced Parser")
+                      }
+                      // Create a minimal parsedContent structure
+                      parsedContent = { files: enhancedParserFiles }
                     }
                   }
                   
@@ -332,7 +426,8 @@ export default function Home() {
                       files = {}
                       parsedContent.files.forEach((file: any) => {
                         if (file.path && file.content !== undefined) {
-                          files[file.path] = file.content
+                          // Ensure content is a string
+                          files[file.path] = String(file.content || '')
                         }
                       })
                     }
@@ -341,10 +436,24 @@ export default function Home() {
                     files = parsedContent as Record<string, string>
                   }
                   
+                  // Ensure all file contents are strings
+                  Object.keys(files).forEach(filePath => {
+                    if (typeof files[filePath] !== 'string') {
+                      console.warn(`[v0] Converting non-string content for ${filePath}:`, typeof files[filePath])
+                      files[filePath] = String(files[filePath] || '')
+                    }
+                  })
+                  
                   // Fix common export issues
                   Object.keys(files).forEach(filePath => {
                     if (filePath.endsWith('.jsx') || filePath.endsWith('.js')) {
                       let content = files[filePath]
+                      
+                      // Ensure content is a string
+                      if (typeof content !== 'string') {
+                        console.warn(`[v0] File ${filePath} content is not a string:`, typeof content, content)
+                        content = String(content || '')
+                      }
                       
                       // Fix App.jsx export issues
                       if (filePath === 'src/App.jsx' || filePath.endsWith('/App.jsx')) {
@@ -389,7 +498,7 @@ export default function Home() {
                         
                         if (componentName && componentName !== 'App' && componentName !== 'main' && componentName !== 'index') {
                           // Check if it's a React component (has JSX)
-                          if (content.includes('<') && content.includes('>')) {
+                          if (typeof content === 'string' && content.includes('<') && content.includes('>')) {
                             // Replace named exports with default exports for components
                             const namedExportPattern = new RegExp(`export\\s*{\\s*${componentName}\\s*}`, 'g')
                             content = content.replace(namedExportPattern, `export default ${componentName}`)
@@ -414,20 +523,76 @@ export default function Home() {
                   const fileCount = Object.keys(files).length
                   if (fileCount === 0) {
                     // Fallback: Use files detected by Enhanced Parser
+                    console.log("[v0] No files from JSON parsing, checking Enhanced Parser results...")
+                    console.log("[v0] Enhanced Parser files count:", Object.keys(files).length)
+                    
                     if (Object.keys(files).length === 0) {
-                      console.log("[v0] No files from JSON parsing, checking Enhanced Parser results...")
-                      // The Enhanced Parser should have populated files during streaming
-                      if (Object.keys(files).length === 0) {
-                    throw new Error("No files were generated")
+                      console.log("[v0] No files from Enhanced Parser either")
+                      console.log("[v0] Raw accumulated content length:", accumulatedContent.length)
+                      console.log("[v0] Raw content preview:", accumulatedContent.substring(0, 1000))
+                      
+                      // Try one more time to extract any files from the raw content
+                      const filePattern = /"([^"]+\.(js|jsx|ts|tsx|css|html|json|md|txt))"\s*:\s*"([^"]*(?:\\.[^"]*)*)"/g
+                      let match
+                      const extractedFiles: Record<string, string> = {}
+                      
+                      while ((match = filePattern.exec(accumulatedContent)) !== null) {
+                        const [, fileName, , fileContent] = match
+                        const decodedContent = fileContent
+                          .replace(/\\n/g, "\n")
+                          .replace(/\\"/g, '"')
+                          .replace(/\\t/g, "\t")
+                          .replace(/\\\\/g, "\\")
+                        extractedFiles[fileName] = decodedContent
+                      }
+                      
+                      if (Object.keys(extractedFiles).length > 0) {
+                        console.log("[v0] Found files using regex fallback:", Object.keys(extractedFiles))
+                        files = extractedFiles
+                      } else {
+                        throw new Error("No files were generated. The AI response may be incomplete or malformed.")
                       }
                     }
                   }
 
                   console.log("[v0] Successfully parsed code with", Object.keys(files).length, "files")
                   
+                  // Validate files
+                  const validationResults = fileValidator.validateFiles(files)
+                  const hasErrors = Object.values(validationResults).some(result => !result.isValid)
+                  
+                  if (hasErrors) {
+                    console.warn("[v0] File validation warnings:")
+                    Object.entries(validationResults).forEach(([path, result]) => {
+                      if (result.errors.length > 0) {
+                        console.warn(`[v0] ${path}:`, result.errors)
+                      }
+                      if (result.warnings.length > 0) {
+                        console.warn(`[v0] ${path}:`, result.warnings)
+                      }
+                    })
+                  }
+                  
+                  // Cache the parsed files
+                  fileCache.setByHash(files, files)
+                  
+                  // Create snapshot for diff tracking
+                  const snapshot = diffTracker.createSnapshot(files)
+                  console.log(`[v0] Created snapshot ${snapshot.id} with ${snapshot.changes.length} changes`)
+                  
+                  // Log changes
+                  if (snapshot.changes.length > 0) {
+                    console.log("[v0] File changes:")
+                    snapshot.changes.forEach(change => {
+                      console.log(`  ${change.type}: ${change.path}`)
+                    })
+                  }
+                  
                   // Process diff/patch blocks if this is a modification
                   if (isModification && generatedCode?.files) {
                     console.log("[v0] Processing modification with diff/patch system")
+                    console.log("[v0] Original files count:", Object.keys(generatedCode.files).length)
+                    console.log("[v0] New files count:", Object.keys(files).length)
                     
                     const processedFiles: Record<string, string> = {}
                     let hasAnyChanges = false
@@ -436,6 +601,9 @@ export default function Home() {
                     Object.keys(files).forEach(filePath => {
                       const fileContent = files[filePath]
                       const originalContent = generatedCode.files[filePath]
+                      
+                      console.log(`[v0] Processing file: ${filePath}`)
+                      console.log(`[v0] Has diff blocks:`, fileContent.includes('<<<<<<< SEARCH'))
                       
                       // Check if this file has diff/patch blocks
                       if (fileContent.includes('<<<<<<< SEARCH') && 
@@ -457,19 +625,35 @@ export default function Home() {
                           console.log(`[v0] No changes applied to ${filePath}`)
                         }
                       } else {
-                        // No diff/patch blocks, use original content
-                        processedFiles[filePath] = originalContent
+                        // No diff/patch blocks, check if content is different
+                        if (originalContent && originalContent !== fileContent) {
+                          console.log(`[v0] File ${filePath} has different content, using new content`)
+                          processedFiles[filePath] = fileContent
+                          hasAnyChanges = true
+                        } else {
+                          processedFiles[filePath] = originalContent || fileContent
+                        }
                       }
                     })
                     
+                    console.log("[v0] Has any changes:", hasAnyChanges)
+                    
                     if (!hasAnyChanges) {
                       console.log("[v0] No changes detected in modification")
-                      return
+                      // Still update the generatedCode to keep the UI in preview mode
+                      // but with the original content (no changes applied)
+                      finalContent.files = generatedCode.files
+                    } else {
+                      // Update the final content with processed files
+                      finalContent.files = processedFiles
+                      console.log("[v0] Modification processed successfully with diff/patch system")
                     }
-                    
-                    // Update the final content with processed files
-                    finalContent.files = processedFiles
-                    console.log("[v0] Modification processed successfully with diff/patch system")
+                  }
+                  
+                  // Extract and store AI response text for chat
+                  const aiResponseText = extractAiResponseText(accumulatedContent)
+                  if (aiResponseText) {
+                    setAiResponse(aiResponseText)
                   }
                   
                   setGeneratedCode(finalContent)
@@ -508,6 +692,13 @@ export default function Home() {
 
               try {
                 const parsed = JSON.parse(data)
+                console.log("[v0] Parsed streaming data:", { 
+                  hasError: !!parsed.error, 
+                  hasContent: !!parsed.content,
+                  contentLength: parsed.content?.length || 0,
+                  data: data.substring(0, 100) + "..."
+                })
+                
                 if (parsed.error) {
                   let errorDetails = parsed.details || ""
 
@@ -524,13 +715,19 @@ export default function Home() {
                 }
                 if (parsed.content) {
                   accumulatedContent += parsed.content
+                  console.log("[v0] Accumulated content length:", accumulatedContent.length)
                   
                   // Process with Enhanced Parser
                   enhancedParser.parse("generation", accumulatedContent)
                   
+                  // Process with We0-style Streaming Parser
+                  streamingParser.parse("generation", accumulatedContent)
+                  
                   setStreamingCode(accumulatedContent)
                   setRawStreamContent(accumulatedContent)
                   parseStreamingContent(accumulatedContent)
+                } else {
+                  console.log("[v0] No content in parsed data:", parsed)
                 }
               } catch (e) {}
             }
@@ -544,6 +741,18 @@ export default function Home() {
         details: "Failed to connect to the server. Please check your internet connection and try again.",
       })
     } finally {
+      // Track performance
+      const duration = performance.now() - startTime
+      performanceTracker.trackTiming(
+        isModification ? 'modification' : 'generation', 
+        duration, 
+        { 
+          fileCount: Object.keys(streamingFiles).length,
+          promptLength: prompt.length,
+          model: selectedModel
+        }
+      )
+      
       setIsGenerating(false)
     }
   }
@@ -793,6 +1002,8 @@ Please analyze the error and return the complete fixed code in the same JSON for
             onBack={() => setGeneratedCode(null)}
             onFixWithAI={handleFixWithAI}
             onModify={handleModify}
+            initialPrompt={initialPrompt}
+            aiResponse={aiResponse}
           />
         </div>
       )}

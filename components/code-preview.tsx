@@ -16,6 +16,7 @@ import {
 import JSZip from "jszip"
 import { webContainerManager } from "@/lib/webcontainer-manager"
 import { ModificationChat } from "./modification-chat"
+import { ChangeTracker } from "./change-tracker"
 
 interface CodePreviewProps {
   code: { files: Record<string, string> } | null
@@ -23,10 +24,12 @@ interface CodePreviewProps {
   onBack: () => void
   onFixWithAI?: (errorMessage: string, files: Record<string, string>) => void
   onModify?: (prompt: string) => Promise<void>
+  initialPrompt?: string
+  aiResponse?: string
 }
 
-export function CodePreview({ code, isGenerating, onBack, onFixWithAI, onModify }: CodePreviewProps) {
-  const [activeTab, setActiveTab] = useState<"preview" | "code">("preview")
+export function CodePreview({ code, isGenerating, onBack, onFixWithAI, onModify, initialPrompt, aiResponse }: CodePreviewProps) {
+  const [activeTab, setActiveTab] = useState<"preview" | "code" | "changes">("preview")
   const [selectedFile, setSelectedFile] = useState<string>("")
   const [previewUrl, setPreviewUrl] = useState<string>("")
   const [logs, setLogs] = useState<string[]>([])
@@ -106,9 +109,65 @@ export function CodePreview({ code, isGenerating, onBack, onFixWithAI, onModify 
       addLog("WebContainer ready")
 
       const files = { ...code.files }
+      
+      // Check and create missing essential files
       if (!files["src/index.css"]) {
         addLog("Warning: src/index.css missing, creating default file...")
-        files["src/index.css"] = "* { margin: 0; padding: 0; box-sizing: border-box; }"
+        files["src/index.css"] = `* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}`
+      }
+      
+      if (!files["src/main.jsx"]) {
+        addLog("Warning: src/main.jsx missing, creating default file...")
+        files["src/main.jsx"] = `import { createRoot } from 'react-dom/client'
+import App from './App.jsx'
+import './index.css'
+
+createRoot(document.getElementById('root')).render(<App />)`
+      }
+      
+      if (!files["src/App.jsx"]) {
+        addLog("Warning: src/App.jsx missing, creating default file...")
+        files["src/App.jsx"] = `import React from 'react'
+import './App.css'
+
+function App() {
+  return (
+    <div className="App">
+      <h1>Welcome to React + Vite</h1>
+      <p>Your generated app is ready!</p>
+    </div>
+  )
+}
+
+export default App`
+      }
+      
+      if (!files["src/App.css"]) {
+        addLog("Warning: src/App.css missing, creating default file...")
+        files["src/App.css"] = `.App {
+  text-align: center;
+  padding: 2rem;
+}
+
+.App h1 {
+  color: #333;
+  margin-bottom: 1rem;
+}
+
+.App p {
+  color: #666;
+  font-size: 1.1rem;
+}`
       }
 
       // Helper function to convert string to Uint8Array
@@ -494,6 +553,15 @@ export function CodePreview({ code, isGenerating, onBack, onFixWithAI, onModify 
               <Code2 className="w-4 h-4 mr-2" />
               Code
             </Button>
+            <Button
+              variant={activeTab === "changes" ? "default" : "ghost"}
+              size="sm"
+              onClick={() => setActiveTab("changes")}
+              className="rounded-xl"
+            >
+              <RefreshCw className="w-4 h-4 mr-2" />
+              Changes
+            </Button>
           </div>
         </div>
       </div>
@@ -602,11 +670,23 @@ export function CodePreview({ code, isGenerating, onBack, onFixWithAI, onModify 
               </pre>
             </div>
           </div>
+
+          <div className={`h-full ${activeTab === "changes" ? "" : "hidden"}`}>
+            <div className="h-full overflow-auto p-4">
+              <ChangeTracker />
+            </div>
+          </div>
         </div>
 
         {onModify && code?.files && (
           <div className="w-96 flex-shrink-0">
-            <ModificationChat currentFiles={code.files} onModify={onModify} isModifying={isGenerating} />
+            <ModificationChat 
+              currentFiles={code.files} 
+              onModify={onModify} 
+              isModifying={isGenerating}
+              initialPrompt={initialPrompt}
+              aiResponse={aiResponse}
+            />
           </div>
         )}
       </div>

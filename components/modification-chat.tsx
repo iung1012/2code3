@@ -17,16 +17,41 @@ interface ModificationChatProps {
   currentFiles: Record<string, string>
   onModify: (prompt: string) => Promise<void>
   isModifying: boolean
+  initialPrompt?: string
+  aiResponse?: string
 }
 
-export function ModificationChat({ currentFiles, onModify, isModifying }: ModificationChatProps) {
-  const [messages, setMessages] = useState<Message[]>([
-    {
+export function ModificationChat({ currentFiles, onModify, isModifying, initialPrompt, aiResponse }: ModificationChatProps) {
+  const [messages, setMessages] = useState<Message[]>(() => {
+    const initialMessages: Message[] = []
+    
+    // Add initial prompt as first message if provided
+    if (initialPrompt) {
+      initialMessages.push({
+        role: "user",
+        content: `📝 Prompt inicial: "${initialPrompt}"`,
+        timestamp: new Date(),
+      })
+    }
+    
+    // Add AI response if provided
+    if (aiResponse) {
+      initialMessages.push({
+        role: "assistant",
+        content: aiResponse,
+        timestamp: new Date(),
+      })
+    }
+    
+    // Add welcome message
+    initialMessages.push({
       role: "assistant",
       content: "Olá! Posso ajudar a modificar seu website. Descreva o que você gostaria de mudar.",
       timestamp: new Date(),
-    },
-  ])
+    })
+    
+    return initialMessages
+  })
   const [input, setInput] = useState("")
   const scrollRef = useRef<HTMLDivElement>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
