@@ -111,10 +111,15 @@ export function CodePreview({ code, isGenerating, onBack, onFixWithAI, onModify 
         files["src/index.css"] = "* { margin: 0; padding: 0; box-sizing: border-box; }"
       }
 
+      // Helper function to convert string to Uint8Array
+      const stringToUint8Array = (str: string): Uint8Array => {
+        return new TextEncoder().encode(str)
+      }
+
       const fileSystem: any = {
         "package.json": {
           file: {
-            contents: JSON.stringify(
+            contents: stringToUint8Array(JSON.stringify(
               {
                 name: "generated-website",
                 private: true,
@@ -136,19 +141,21 @@ export function CodePreview({ code, isGenerating, onBack, onFixWithAI, onModify 
               },
               null,
               2,
-            ),
+            )),
           },
         },
         "vite.config.js": {
           file: {
-            contents:
-              "import { defineConfig } from 'vite'\nimport react from '@vitejs/plugin-react'\n\nexport default defineConfig({\n  plugins: [react()],\n})",
+            contents: stringToUint8Array(
+              "import { defineConfig } from 'vite'\nimport react from '@vitejs/plugin-react'\n\nexport default defineConfig({\n  plugins: [react()],\n})"
+            ),
           },
         },
         "index.html": {
           file: {
-            contents:
-              '<!doctype html>\n<html lang="en">\n  <head>\n    <meta charset="UTF-8" />\n    <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n    <title>Generated Website</title>\n  </head>\n  <body>\n    <div id="root"></div>\n    <script type="module" src="/src/main.jsx"></script>\n  </body>\n</html>',
+            contents: stringToUint8Array(
+              '<!doctype html>\n<html lang="en">\n  <head>\n    <meta charset="UTF-8" />\n    <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n    <title>Generated Website</title>\n  </head>\n  <body>\n    <div id="root"></div>\n    <script type="module" src="/src/main.jsx"></script>\n  </body>\n</html>'
+            ),
           },
         },
       }
@@ -168,7 +175,7 @@ export function CodePreview({ code, isGenerating, onBack, onFixWithAI, onModify 
         const fileName = parts[parts.length - 1]
         current[fileName] = {
           file: {
-            contents: content,
+            contents: stringToUint8Array(content),
           },
         }
       }
